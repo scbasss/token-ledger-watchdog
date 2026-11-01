@@ -1,0 +1,25 @@
+# Ledger databases: personal usage aggregates. Never commit.
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+*-journal
+*-wal
+*-shm
+
+# LiteLLM price cache and its atomic-write temp files
+prices.json
+.prices-*.tmp
+
+# Claude Code transcripts (and any other JSONL). Never commit.
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Environment / local config
+.env*
