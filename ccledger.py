@@ -16,6 +16,7 @@ Usage:
     python ccledger.py report projects
     python ccledger.py watch [--poll 3] [--stall-usd 1.00]
     python ccledger.py schema
+    python ccledger.py sync [--dry-run] [--no-ingest]
 Global options: --db PATH (or CCLEDGER_DB), --tz IANA_NAME.
 Reports ingest incrementally first; --no-ingest skips that.
 Data lives in %LOCALAPPDATA%\\ccledger (or $XDG_DATA_HOME/ccledger elsewhere).
@@ -23,15 +24,20 @@ Data lives in %LOCALAPPDATA%\\ccledger (or $XDG_DATA_HOME/ccledger elsewhere).
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
+import ipaddress
 import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass, field
@@ -1537,6 +1543,328 @@ def run_watch(conn, roots, prices, tz, poll: float, stall_usd: float, excluded,
         print("\nwatch stopped (nothing was written to transcripts or signalled)")
 
 
+# ---------------------------------------------------------------- sync (Layer 2)
+
+SYNC_SCHEMA_VERSION = 1
+# THE payload contract: the only thing that ever leaves the machine. A rollup
+# row has exactly these keys and a batch exactly SYNC_ENVELOPE_FIELDS.
+# test_layer2 asserts both key sets, and the server rejects anything else, so
+# a field cannot ship without a deliberate edit here, there, and in the docs.
+ROLLUP_FIELDS = (
+    "date", "model", "project", "calls", "input_tokens", "output_tokens",
+    "cache_read_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens",
+    "cost_stored_usd", "cost_calculated_usd",
+)
+SYNC_ENVELOPE_FIELDS = ("device_name", "schema_version", "rollups")
+SYNC_PATH = "/v1/rollups"
+SYNC_WATERMARK_KEY = "sync_watermark"
+SYNC_BATCH_ROWS = 2000  # a date is never split across batches
+SYNC_TIMEOUT_SECONDS = 20
+SYNC_MAX_RESPONSE = 64 * 1024
+SYNC_MAX_CONFIG_BYTES = 64 * 1024
+MAX_DEVICE_NAME = 128
+DEFAULT_DEVICE_NAME = "unnamed-device"
+SYNC_SALT_FILE = "sync.salt"  # beside sync.json; never sent, printed or committed
+PROJECT_HASH_PREFIX = "h:"
+PROJECT_SUFFIX_SEP = "·"  # middle dot: "app·a3f9"
+
+ROLLUP_SQL = (
+    "SELECT model, project, COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read), "
+    "SUM(cache_create_5m), SUM(cache_create_1h), "
+    "COALESCE(SUM(CASE WHEN cost_source='stored' THEN cost_usd END),0), "
+    "COALESCE(SUM(CASE WHEN cost_source='calculated' THEN cost_usd END),0) "
+    "FROM billable WHERE ts_utc >= ? AND ts_utc < ? GROUP BY model, project ORDER BY model, project"
+)
+
+
+class SyncError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class SyncConfig:
+    url: str | None
+    key: str | None
+    device_name: str
+
+
+def _sync_str(v, what: str) -> str | None:
+    if v is None:
+        return None
+    if not isinstance(v, str):
+        raise SystemExit(f"sync config: {what} must be a string")
+    return v.strip() or None
+
+
+def load_sync_config(data_dir: Path, env=None) -> SyncConfig:
+    """Environment variables win over <data dir>/sync.json. Never read from the repo."""
+    env = os.environ if env is None else env
+    path = data_dir / "sync.json"
+    file_cfg: object = {}
+    try:
+        if path.stat().st_size > SYNC_MAX_CONFIG_BYTES:
+            raise SystemExit(f"sync config: {path} is too large")
+        file_cfg = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"sync config: cannot read {path} ({type(e).__name__})") from None
+    if not isinstance(file_cfg, dict):
+        raise SystemExit(f"sync config: {path} must be a JSON object")
+    url = _sync_str(env.get("CCLEDGER_SYNC_URL"), "CCLEDGER_SYNC_URL") or _sync_str(file_cfg.get("url"), "url")
+    key = _sync_str(env.get("CCLEDGER_SYNC_KEY"), "CCLEDGER_SYNC_KEY") or _sync_str(file_cfg.get("key"), "key")
+    # Deliberately not the hostname: an unset name must not identify the machine.
+    name = (_sync_str(env.get("CCLEDGER_DEVICE_NAME"), "CCLEDGER_DEVICE_NAME")
+            or _sync_str(file_cfg.get("device_name"), "device_name") or DEFAULT_DEVICE_NAME)
+    if not name.isprintable() or len(name) > MAX_DEVICE_NAME:
+        raise SystemExit(f"sync config: device name must be printable text, at most {MAX_DEVICE_NAME} chars")
+    if key and not (key.isascii() and key.isprintable() and " " not in key):
+        raise SystemExit("sync config: device key must be printable ASCII without spaces")
+    return SyncConfig(url, key, name)
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def sync_endpoint(url: str) -> str:
+    """Accepts a server base URL or the full /v1/rollups URL; http(s) only."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises ValueError on a bad port
+    except ValueError:
+        raise SyncError("sync url is not a valid URL") from None
+    if parts.scheme not in ("http", "https") or not host:
+        raise SyncError("sync url must look like http(s)://host[:port]")
+    if parts.username or parts.password or parts.query or parts.fragment:
+        raise SyncError("sync url must not contain credentials, a query, or a fragment")
+    path = parts.path.rstrip("/")
+    if not path.endswith(SYNC_PATH):
+        path += SYNC_PATH
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def daily_rollups(conn, tz, after: date | None, today: date) -> list[dict]:
+    """Local-date rollups of the billable view for every date in (after, today].
+
+    Same view and same day boundaries as `report`, so the totals reconcile.
+    """
+    if after is None:
+        first = conn.execute("SELECT MIN(ts_utc) FROM billable").fetchone()[0]
+        if first is None:
+            return []
+        start = to_local(first, tz).date()
+    else:
+        start = min(after, today - timedelta(days=1)) + timedelta(days=1)
+    out: list[dict] = []
+    d = start
+    while d <= today:
+        lo, hi = local_midnight_utc(d, tz), local_midnight_utc(d + timedelta(days=1), tz)
+        for model, project, n, i, o, cr, c5, c1, stored, calc in conn.execute(ROLLUP_SQL, (lo, hi)):
+            out.append(dict(zip(ROLLUP_FIELDS, (
+                d.isoformat(), model, project, n, i, o, cr, c5, c1,
+                round(float(stored), 12), round(float(calc), 12)))))  # round() only strips float noise
+        d += timedelta(days=1)
+    return out
+
+
+def load_project_salt(path: Path) -> bytes:
+    """32 random bytes, created on first use. Losing or changing the file renames
+    every hashed project server-side, so a damaged file is an error, not a reset."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with open(fd, "w", encoding="ascii") as f:
+            f.write(secrets.token_hex(32) + "\n")
+    except FileExistsError:
+        pass
+    except OSError as e:
+        raise SyncError(f"cannot create {path.name} in {path.parent} ({type(e).__name__})") from None
+    try:
+        salt = bytes.fromhex(path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        salt = b""
+    if len(salt) != 32:
+        raise SyncError(f"{path.name} in {path.parent} is damaged; restore it, or delete it "
+                        "to start a new one (hashed project names will then change)")
+    return salt
+
+
+def _local_usernames() -> set[str]:
+    names = {Path.home().name}
+    try:
+        names.add(getpass.getuser())
+    except (OSError, KeyError, ImportError):
+        pass
+    return {n for n in names if n}
+
+
+def _project_digest(salt: bytes, encoded: str) -> str:
+    return hashlib.sha256(salt + encoded.encode("utf-8")).hexdigest()
+
+
+def project_display_names(projects, salt: bytes, resolve=decode_project_dir,
+                          home: Path | None = None, usernames=None) -> dict[str, str]:
+    """Encoded project name -> the value sync sends in its place.
+
+    The folder's base name when the folder still exists, else "h:" + 16 hex of
+    SHA-256(salt + encoded name). The home folder itself, and any name that
+    contains the local username, also become the hash. Computed over the whole
+    project set: base names shared by different projects all get a suffix of 4
+    hex from the same salted hash, so no two projects are merged server-side.
+    """
+    home_key = os.path.normcase(os.path.abspath(home if home is not None else Path.home()))
+    users = [u.casefold() for u in (_local_usernames() if usernames is None else usernames) if u]
+    names: dict[str, str] = {}
+    for enc in set(projects):
+        folder = resolve(enc)
+        name = folder.name if folder is not None else ""
+        lowered = name.casefold()
+        if (not name or not name.isprintable()
+                or os.path.normcase(os.path.abspath(folder)) == home_key
+                or any(lowered == u or (len(u) >= 3 and u in lowered) for u in users)):
+            name = PROJECT_HASH_PREFIX + _project_digest(salt, enc)[:16]
+        names[enc] = name
+    shared: dict[str, list[str]] = {}
+    for enc, name in names.items():
+        shared.setdefault(name, []).append(enc)
+    for name, encs in shared.items():
+        if len(encs) > 1:
+            for enc in encs:
+                names[enc] = f"{name}{PROJECT_SUFFIX_SEP}{_project_digest(salt, enc)[:4]}"
+    if len(set(names.values())) != len(names):
+        raise SyncError("two projects still share a name after suffixing")  # ~1 in 65,536 pairs
+    return names
+
+
+def publish_projects(rollups: list[dict], names: dict[str, str]) -> list[dict]:
+    """The rollups as sent: same rows and numbers, project replaced by its display name."""
+    return [{**r, "project": names[r["project"]]} for r in rollups]
+
+
+def build_batches(rollups: list[dict], device_name: str, batch_rows: int = SYNC_BATCH_ROWS) -> list[dict]:
+    """Envelope + rows. Rollups arrive date-ordered; a date stays whole inside one batch
+    because the server replaces a date's rows as a unit."""
+    by_date: dict[str, list[dict]] = {}
+    for r in rollups:
+        by_date.setdefault(r["date"], []).append(r)
+    chunks: list[list[dict]] = []
+    for rows in by_date.values():
+        if not chunks or len(chunks[-1]) + len(rows) > batch_rows:
+            chunks.append([])
+        chunks[-1].extend(rows)
+    return [{"device_name": device_name, "schema_version": SYNC_SCHEMA_VERSION, "rollups": c}
+            for c in chunks]
+
+
+def read_watermark(conn) -> date | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (SYNC_WATERMARK_KEY,)).fetchone()
+    try:
+        return date.fromisoformat(row[0]) if row else None
+    except ValueError:
+        return None  # corrupt value: fall back to a full (idempotent) resync
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # a redirect would forward the device key to another host
+
+
+def _printable(s: str, limit: int = 200) -> str:
+    return "".join(c for c in s if c.isprintable())[:limit]
+
+
+def post_batch(endpoint: str, key: str, batch: dict) -> int:
+    """POST one batch; returns the server's `accepted` count or raises SyncError."""
+    host = urllib.parse.urlsplit(endpoint).hostname or ""
+    handlers: list = [_NoRedirect]
+    if _is_loopback(host):
+        handlers.append(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
+    body = json.dumps(batch, separators=(",", ":")).encode()
+    req = urllib.request.Request(endpoint, data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": f"Bearer {key}",
+        "User-Agent": "ccledger-sync"})
+    try:
+        with opener.open(req, timeout=SYNC_TIMEOUT_SECONDS) as resp:
+            raw = resp.read(SYNC_MAX_RESPONSE + 1)
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            err = json.loads(e.read(4096)).get("error")
+            detail = f": {_printable(err)}" if isinstance(err, str) else ""
+        except (ValueError, AttributeError, OSError):
+            pass
+        raise SyncError(f"server returned HTTP {e.code}{detail}") from None
+    except urllib.error.URLError as e:
+        raise SyncError(f"could not reach {host or endpoint}: {_printable(str(e.reason))}") from None
+    except (OSError, ValueError) as e:  # timeouts, resets, bad header values
+        raise SyncError(f"request failed: {type(e).__name__}: {_printable(str(e))}") from None
+    if status != 200 or len(raw) > SYNC_MAX_RESPONSE:
+        raise SyncError(f"unexpected response (HTTP {status})")
+    try:
+        accepted = json.loads(raw).get("accepted")
+    except (ValueError, AttributeError):
+        accepted = None
+    if isinstance(accepted, bool) or not isinstance(accepted, int):
+        raise SyncError("server response was not {\"accepted\": N}")
+    return accepted
+
+
+def sync_ledger(conn, tz, cfg: SyncConfig, dry_run: bool, today: date | None = None,
+                post=post_batch, *, salt_path: Path) -> int:
+    """Push rollups for dates after the watermark, through today. Exit status."""
+    if not dry_run and not (cfg.url and cfg.key):
+        print("sync not configured")
+        return 0
+    today = today or local_now(tz).date()
+    rollups = daily_rollups(conn, tz, read_watermark(conn), today)
+    if not rollups:
+        print("sync: nothing to send")
+        return 0
+    try:
+        # The whole project set, not just this window's, so suffixes stay put between syncs.
+        projects = [r[0] for r in conn.execute("SELECT DISTINCT project FROM billable")]
+        names = project_display_names(projects, load_project_salt(salt_path))
+    except SyncError as e:
+        print(f"sync failed: {e}; nothing sent", file=sys.stderr)
+        return 1
+    batches = build_batches(publish_projects(rollups, names), cfg.device_name)
+    rows = len(rollups)
+    if dry_run:
+        for b in batches:
+            print(json.dumps(b, indent=2))
+        print(f"sync dry run: {rows} rollup rows in {len(batches)} batch(es); nothing sent",
+              file=sys.stderr)
+        return 0
+    try:
+        endpoint = sync_endpoint(cfg.url)
+        if endpoint.startswith("http://") and not _is_loopback(urllib.parse.urlsplit(endpoint).hostname):
+            print("warning: device key is sent over plain http", file=sys.stderr)
+        for b in batches:
+            accepted = post(endpoint, cfg.key, b)
+            if accepted != len(b["rollups"]):
+                raise SyncError(f"server accepted {accepted} of {len(b['rollups'])} rows")
+    except SyncError as e:
+        print(f"sync failed: {e}; watermark not advanced", file=sys.stderr)
+        return 1
+    # Yesterday and earlier are complete; today is re-sent (and replaced) next time.
+    mark = (today - timedelta(days=1)).isoformat()
+    try:
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (SYNC_WATERMARK_KEY, mark))
+    except sqlite3.Error as e:
+        print(f"warning: pushed, but could not save the watermark ({type(e).__name__}); "
+              "the next sync will resend, which is harmless", file=sys.stderr)
+    print(f"sync: pushed {rows} rollup rows in {len(batches)} batch(es); watermark {mark}")
+    return 0
+
+
 # ---------------------------------------------------------------- cli
 
 
@@ -1590,6 +1918,14 @@ def main(argv: list[str] | None = None) -> int:
                      help="alert when this much $ is spent in 10 min with no project file changes")
     wat.add_argument("--polls", type=int, default=None, help=argparse.SUPPRESS)  # tests
     sub.add_parser("schema", help="print the calls schema and the no-content check")
+    syn = sub.add_parser(
+        "sync", parents=[src],
+        help="push daily aggregate rollups to a Watchdog server (Layer 2)",
+        description="Sends daily rollups only (see ROLLUP_FIELDS): no sessions, paths or content. "
+                    "Configure with CCLEDGER_SYNC_URL / CCLEDGER_SYNC_KEY / CCLEDGER_DEVICE_NAME "
+                    "or sync.json beside the ledger. Failure never affects ingest or reports.")
+    syn.add_argument("--dry-run", action="store_true", help="print the exact JSON that would be sent; send nothing")
+    syn.add_argument("--no-ingest", action="store_true", help="sync the ledger as it stands")
     args = ap.parse_args(argv)
     db = Path(args.db)
     if args.cmd == "report" and args.month and args.what != "month":
@@ -1633,6 +1969,26 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             conn.close()
         return 0
+
+    if args.cmd == "sync":
+        cfg = load_sync_config(db.parent)
+        if not (cfg.url and cfg.key):
+            if not args.dry_run:
+                print("sync not configured")
+                return 0
+            print("sync not configured (dry run only)", file=sys.stderr)
+        if not args.no_ingest:
+            conn = open_and_ingest(quiet=True)[0]
+        elif db.exists():
+            conn = connect(db)
+        else:
+            print(f"no ledger at {db}; run `ingest` first", file=sys.stderr)
+            return 1
+        try:
+            check_readable_schema(conn)
+            return sync_ledger(conn, tz, cfg, args.dry_run, salt_path=db.parent / SYNC_SALT_FILE)
+        finally:
+            conn.close()
 
     if args.cmd == "report" and not args.no_ingest:
         open_and_ingest(quiet=True)[0].close()

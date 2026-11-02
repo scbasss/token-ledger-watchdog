@@ -23,3 +23,8 @@ __pycache__/
 
 # Environment / local config
 .env*
+
+# Layer 2 sync config holds the device key; sync.salt keys the project-name hashes.
+# Only sync.example.json is tracked.
+sync.json
+sync.salt
